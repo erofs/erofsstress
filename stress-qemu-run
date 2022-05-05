@@ -1,0 +1,15 @@
+#!/bin/sh -e
+
+mem="768M"
+
+fallocate -l 11g overlay.ext4 && mkfs.ext4 -O ^has_journal,^uninit_bg,^ext_attr,^huge_file,^64bit -q overlay.ext4
+sync
+qemu-system-x86_64 -nographic -serial mon:stdio -m $mem -smp 4 \
+	--accel tcg,thread=multi -kernel $1 \
+	-drive file=$2,index=0,readonly,media=cdrom \
+	-hdb overlay.ext4 -hdc $3 -hdd $4 \
+	-net nic,model=e1000 -net user \
+	-append "net.ifnames=0 root=/dev/sr0 console=ttyS0 qemuktest.timeout=$5 qemuktest.seed=$6"
+
+(mkdir -p mnt && sudo mount -o loop overlay.ext4 mnt && cp -f mnt/exitstatus . && sudo umount mnt)
+{ [ -f exitstatus ] && [ "x`cat exitstatus`" = "x0" ]; }
