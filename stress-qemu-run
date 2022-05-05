@@ -1,0 +1,22 @@
+#!/bin/sh -e
+
+cpus=4
+mem="768M"
+if [ -e /dev/kvm ]; then
+echo Trying to use KVM...
+kvm="--enable-kvm -cpu host"
+else
+kvm="--accel tcg,thread=multi"
+fi
+
+fallocate -l 11g logdev.ext4 && mkfs.ext4 -O ^has_journal,^uninit_bg,^ext_attr,^huge_file,^64bit -q logdev.ext4
+sync
+qemu-system-x86_64 -nographic -serial mon:stdio -m $mem -smp $cpus $kvm -kernel "$1" \
+	-drive file="$2",index=0,readonly=on,media=cdrom \
+	-hdb logdev.ext4 -hdc "$3" -hdd "$4" \
+	-net nic,model=e1000 -net user \
+	-append "net.ifnames=0 root=/dev/sr0 console=ttyS0 qemuktest.timeout=$5 qemuktest.seed=$6"
+
+(mkdir -p mnt && sudo mount -o loop logdev.ext4 mnt && find mnt -maxdepth 1 -type f -exec cp '{}' . \; && sudo umount mnt)
+rm -f logdev.ext4
+{ [ -f exitstatus ] && [ "x`cat exitstatus`" = "x0" ]; }

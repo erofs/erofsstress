@@ -1,0 +1,246 @@
+name: stress
+
+on:
+  schedule:
+    - cron:  '0 0,8,16 * * *'
+  # Allows to run this workflow manually from the Actions tab
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: 'Kernel Git Repository'
+        default: 'git://git.kernel.org/pub/scm/linux/kernel/git/xiang/erofs.git'
+        required: true
+        type: string
+      kernel_branch:
+        description: 'Kernel Git Branch'
+        default: 'dev-test'
+        required: true
+        type: string
+      utils_repo:
+        description: 'erofs-utils Git Repository'
+        default: 'git://git.kernel.org/pub/scm/linux/kernel/git/xiang/erofs-utils.git'
+        required: true
+        type: string
+      utils_branch:
+        description: 'erofs-utils Git Branch'
+        default: 'experimental'
+        required: true
+        type: string
+      timeout:
+        description: 'Stress timeout'
+        default: 7200
+        required: true
+        type: number
+      stress-mkfs-options:
+        description: "Customized mkfs options for stress testing"
+        default: ''
+        required: false
+        type: string
+
+env:
+  LZ4_VER: 1.10.0
+  XZ_VER: 5.6.4
+  KERNEL_REPO: ${{ github.event_name == 'schedule' && 'git://git.kernel.org/pub/scm/linux/kernel/git/xiang/erofs.git' || github.event.inputs.kernel_repo }}
+  KERNEL_BRANCH: ${{ github.event_name == 'schedule' && 'dev-test' || github.event.inputs.kernel_branch }}
+  UTILS_REPO: ${{ github.event_name == 'schedule' && 'git://git.kernel.org/pub/scm/linux/kernel/git/xiang/erofs-utils.git' || github.event.inputs.utils_repo }}
+  UTILS_BRANCH: ${{ github.event_name == 'schedule' && 'experimental' || github.event.inputs.utils_branch }}
+  TIMEOUT: ${{ github.event_name == 'schedule' && 14400 || github.event.inputs.timeout }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build-kernel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Get the HEAD commit ID
+        id: get_version_id
+        run: |
+          while true; do
+            COMMIT=`git ls-remote "$KERNEL_REPO" "$KERNEL_BRANCH" | cut -c1-12`
+            [ "x$COMMIT" = "x" ] || break
+          done
+          echo "scm_version=$COMMIT" >> $GITHUB_OUTPUT
+      - name: Cache bzImage
+        id: cache-bzImage
+        uses: actions/cache@v4
+        with:
+          path: |
+            erofs/arch/x86/boot/bzImage
+          key: bzImage-${{ steps.get_version_id.outputs.scm_version }}
+      - name: Clone latest tree
+        if: steps.cache-bzImage.outputs.cache-hit != 'true'
+        run: |
+          sudo rm -rf erofs; mkdir -p erofs
+          git clone $KERNEL_REPO -n --no-tags erofs
+          (cd erofs; git checkout ${{ steps.get_version_id.outputs.scm_version }}; rm -rf .git)
+      - name: Build the kernel
+        if: steps.cache-bzImage.outputs.cache-hit != 'true'
+        run: |
+          sudo apt -qq update
+          sudo apt install -y libssl-dev libelf-dev flex bison dwarves bc
+          cd erofs
+          scripts/kconfig/merge_config.sh -m arch/x86/configs/x86_64_defconfig ../stress-kconfig && \
+            make olddefconfig && make -j12
+      - name: Upload bzImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: erofs-bzImage
+          path: |
+            erofs/arch/x86/boot/bzImage
+
+  build-erofs-utils:
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        suffix: ["", "_mt"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build erofs-utils
+        run: |
+          sudo apt-get -qq update
+          sudo apt-get install -y autoconf automake libtool pkg-config libfuse-dev libselinux1-dev libzstd-dev uuid-dev
+          curl -L https://github.com/lz4/lz4/releases/download/v$LZ4_VER/lz4-$LZ4_VER.tar.gz | tar -zxv
+          (cd lz4-$LZ4_VER; make BUILD_STATIC=no; sudo make install BUILD_STATIC=no)
+          curl -L https://github.com/tukaani-project/xz/releases/download/v$XZ_VER/xz-$XZ_VER.tar.gz | tar -zxv
+          (cd xz-$XZ_VER; ./configure; sudo make install)
+          rm -rf erofs-utils; mkdir -p erofs-utils
+          git clone $UTILS_REPO -b $UTILS_BRANCH erofs-utils
+          cd erofs-utils
+          MT="dis";[ "x${{ matrix.suffix }}" = "x_mt" ] && MT="en"
+          mkdir output
+          ./autogen.sh && ./configure --enable-debug --enable-werror --enable-fuse \
+              --enable-lz4 --enable-lzma --with-selinux --with-libzstd \
+              --${MT}able-multithreadding \
+              --prefix=$(pwd)/output && \
+              make && make install
+          cp -f contrib/stress output/bin
+      - name: Upload erofs-utils
+        uses: actions/upload-artifact@v4
+        with:
+          name: erofs-utils${{ matrix.suffix }}
+          path: |
+            erofs-utils/output
+
+  gen-golden-image:
+    runs-on: ubuntu-latest
+    needs: build-erofs-utils
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache golden image
+        id: cache-golden
+        uses: actions/cache@v4
+        with:
+          path: |
+            golden.erofs
+          key: golden-${{ hashFiles('./genimage') }}
+      - name: Download erofs-utils prebuilts
+        if: steps.cache-golden.outputs.cache-hit != 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: erofs-utils
+      - name: Set up golden image
+        if: steps.cache-golden.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get -qq update
+          sudo apt-get install -y busybox
+          chmod +x bin/mkfs.erofs bin/fsck.erofs bin/erofsfuse
+          ./genimage testdata golden.erofs '-zlz4hc,12 -Ededupe,fragments,ztailpacking -C65536'
+
+  build-rootfs:
+    runs-on: ubuntu-latest
+    needs: build-erofs-utils
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache rootfs images
+        id: cache-rootfs
+        uses: actions/cache@v4
+        with:
+          path: |
+            rootfs.erofs
+          key: stressrootfs-${{hashFiles('stress-packages', 'stress-overlay', 'genrootfs.sh')}}
+      - name: Download erofs-utils prebuilts
+        if: steps.cache-rootfs.outputs.cache-hit != 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: erofs-utils
+      - name: Generate rootfs
+        if: steps.cache-rootfs.outputs.cache-hit != 'true'
+        run: |
+          chmod +x bin/mkfs.erofs bin/fsck.erofs bin/stress
+          sudo apt-get -qq update
+          sudo cp -f bin/stress stress-overlay/root
+          sudo ./genrootfs rootfs.erofs ./stress-packages stress-overlay "-zlz4hc,12 -C32768 -Ededupe,fragments,ztailpacking --random-pclusterblks"
+
+  qemu-run:
+    runs-on: ubuntu-latest
+    needs: [build-kernel, build-rootfs, gen-golden-image]
+    strategy:
+      matrix:
+        alg: ["", "-zlz4", "-zlz4hc,12", "-zlzma,9", "-zdeflate", "-zzstd"]
+        set: [0, 1]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch rootfs image
+        id: fetch-rootfs
+        uses: actions/cache@v4
+        with:
+          path: |
+            rootfs.erofs
+          key: stressrootfs-${{hashFiles('stress-packages', 'stress-overlay', 'genrootfs.sh')}}
+      - name: Fetch golden image
+        id: fetch-golden
+        uses: actions/cache@v4
+        with:
+          path: |
+            golden.erofs
+          key: golden-${{ hashFiles('./genimage') }}
+      - name: Download erofs-utils prebuilts
+        uses: actions/download-artifact@v4
+        with:
+          name: erofs-utils
+      - name: Download bzImage
+        uses: actions/download-artifact@v4
+        with:
+          name: erofs-bzImage
+      - name: Test with QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y qemu-kvm fuse
+          sudo usermod -a -G kvm "${USER}"
+          # Only configure kvm perms if kvm is available
+          if [[ -e /dev/kvm ]]; then
+            echo "Updating KVM permissions"
+            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+            sudo udevadm control --reload-rules
+            sudo udevadm trigger --name-match=kvm
+          fi
+          chmod +x bin/mkfs.erofs bin/fsck.erofs bin/erofsfuse
+          mkdir mnt
+          bin/erofsfuse golden.erofs mnt
+          if [ "x${{ matrix.set }}" = "x1" ]; then
+            if [ "x${{ matrix.alg }}" = "x" ]; then
+              MKFS_OPTIONS="-Ededupe"
+            else
+              MKFS_OPTIONS="${{ github.event.inputs.stress-mkfs-options }}"
+              [ "x$MKFS_OPTIONS" = "x" ] && MKFS_OPTIONS="-Ededupe,fragments,ztailpacking"
+            fi
+          else
+              MKFS_OPTIONS=""
+          fi
+          bin/mkfs.erofs ${{ matrix.alg }} $MKFS_OPTIONS test.erofs mnt
+          fusermount -u mnt; rm -rf mnt
+          seed=$((RANDOM * RANDOM))
+          echo "random seed: $seed"
+          ./stress-qemu-run bzImage rootfs.erofs test.erofs golden.erofs $TIMEOUT $seed
+      - name: Upload images if the test fails
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: qemu-image-dump
+          path: |
+            *.erofs
+            baddump*
+            !overlay.ext4
