@@ -11,11 +11,26 @@ fi
 
 fallocate -l 11g logdev.ext4 && mkfs.ext4 -O ^has_journal,^uninit_bg,^ext_attr,^huge_file,^64bit -q logdev.ext4
 sync
+
+add_data_disk() {
+  local baseidx=2
+  for disk in "$@"; do
+    echo "-drive file=$disk,if=virtio,index=$baseidx,media=disk"
+    baseidx=$((baseidx + 1))
+  done
+}
+
+ARGS="$*"
+shift 5
+DATA_DISKS=$(add_data_disk "${@}")
+set -- $ARGS
+
 qemu-system-x86_64 -nographic -serial mon:stdio -m $mem -smp $cpus $kvm -kernel "$1" \
 	-drive file="$2",index=0,readonly=on,media=cdrom \
-	-hdb logdev.ext4 -hdc "$3" -hdd "$4" \
+	-drive file=logdev.ext4,if=virtio,index=1,media=disk \
+	$DATA_DISKS \
 	-net nic,model=e1000 -net user \
-	-append "net.ifnames=0 root=/dev/sr0 console=ttyS0 qemuktest.timeout=$5 qemuktest.seed=$6"
+	-append "net.ifnames=0 root=/dev/sr0 console=ttyS0 qemuktest.timeout=$3 qemuktest.seed=$4 qemuktest.share=$5"
 
 (mkdir -p mnt && sudo mount -o loop logdev.ext4 mnt && find mnt -maxdepth 1 -type f -exec cp '{}' . \; && sudo umount mnt)
 rm -f logdev.ext4

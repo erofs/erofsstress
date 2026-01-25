@@ -147,7 +147,7 @@ jobs:
           sudo apt-get -qq update
           sudo apt-get install -y busybox
           chmod +x bin/mkfs.erofs bin/fsck.erofs bin/erofsfuse
-          ./genimage testdata golden.erofs '-zlz4hc,12 -Ededupe,fragments,ztailpacking -C65536'
+          ./genimage testdata golden.erofs '--xattr-inode-digest=sha256.erofs.fingerprint -zlz4hc,12 -Ededupe,fragments,ztailpacking -C65536'
 
   build-rootfs:
     runs-on: ubuntu-latest
@@ -181,6 +181,7 @@ jobs:
       matrix:
         alg: ["", "-zlz4", "-zlz4hc,12", "-zlzma,9", "-zdeflate", "-zzstd"]
         set: [0, 1]
+        share: [0, 1]
     steps:
       - uses: actions/checkout@v4
       - name: Fetch rootfs image
@@ -230,16 +231,23 @@ jobs:
           else
               MKFS_OPTIONS=""
           fi
-          bin/mkfs.erofs ${{ matrix.alg }} $MKFS_OPTIONS test.erofs mnt
-          fusermount -u mnt; rm -rf mnt
           seed=$((RANDOM * RANDOM))
           echo "random seed: $seed"
-          ./stress-qemu-run bzImage rootfs.erofs test.erofs golden.erofs $TIMEOUT $seed
+          if [ "x${{ matrix.share }}" = "x1" ]; then
+            bin/mkfs.erofs ${{ matrix.alg }} $MKFS_OPTIONS --xattr-inode-digest=sha256.erofs.fingerprint testA.erofs mnt
+            bin/mkfs.erofs --xattr-inode-digest=sha256.erofs.fingerprint testB.erofs mnt
+            fusermount -u mnt; rm -rf mnt
+            ./stress-qemu-run bzImage rootfs.erofs $TIMEOUT $seed ${{ matrix.share }} golden.erofs testA.erofs testB.erofs
+          else
+            bin/mkfs.erofs ${{ matrix.alg }} $MKFS_OPTIONS testA.erofs mnt
+            fusermount -u mnt; rm -rf mnt
+            ./stress-qemu-run bzImage rootfs.erofs $TIMEOUT $seed ${{ matrix.share }} golden.erofs testA.erofs
+          fi
       - name: Upload images if the test fails
         uses: actions/upload-artifact@v4
         if: failure()
         with:
-          name: qemu-image-dump
+          name: qemu-image-dump-${{ matrix.alg }}-${{ matrix.set }}-${{ matrix.share }}
           path: |
             *.erofs
             baddump*
